@@ -8,6 +8,12 @@ import robosuite
 from robosuite.environments.manipulation.single_arm_env import SingleArmEnv
 from robosuite.utils.mjcf_utils import string_to_array
 
+
+import robosuite.utils.transform_utils as T
+from robosuite.utils.observables import Observable, sensor, create_gaussian_noise_corrupter
+
+import numpy as np
+
 try:
     # only needed for running hammer cleanup and kitchen tasks
     import robosuite_task_zoo
@@ -18,6 +24,67 @@ import mimicgen
 
 
 class SingleArmEnv_MG(SingleArmEnv):
+            
+    def __init__(
+        self,
+        robots,
+        env_configuration="default",
+        controller_configs=None,
+        mount_types="default", 
+        gripper_types="default",
+        initialization_noise="default",
+        use_camera_obs=True,
+        has_renderer=False,
+        has_offscreen_renderer=True,
+        render_camera="frontview",
+        render_collision_mesh=False,
+        render_visual_mesh=True,
+        render_gpu_device_id=-1,
+        control_freq=20,
+        horizon=1000,
+        ignore_done=False,
+        hard_reset=True,
+        camera_names="agentview",
+        camera_heights=256,
+        camera_widths=256,
+        camera_depths=False,
+        camera_segmentations=None,  # {None, instance, class, element}
+        force_torque_hist_len=100,
+        renderer="mujoco",
+        renderer_config=None    
+    ):
+        
+        self.ft_hist_len = force_torque_hist_len
+
+        self.ft_noise_std = np.array([5.0, 0.05], dtype=np.float64)
+        self.prop_noise_std = np.array([0.001, 0.01], dtype=np.float64)
+        
+        super().__init__(
+            robots=robots,
+            env_configuration=env_configuration,
+            controller_configs=controller_configs,
+            mount_types=mount_types,
+            gripper_types=gripper_types,
+            initialization_noise=initialization_noise,
+            use_camera_obs=use_camera_obs,
+            has_renderer=has_renderer,
+            has_offscreen_renderer=has_offscreen_renderer,
+            render_camera=render_camera,
+            render_collision_mesh=render_collision_mesh,
+            render_visual_mesh=render_visual_mesh,
+            render_gpu_device_id=render_gpu_device_id,
+            control_freq=control_freq,
+            horizon=horizon,
+            ignore_done=ignore_done,
+            hard_reset=hard_reset,
+            camera_names=camera_names,
+            camera_heights=camera_heights,
+            camera_widths=camera_widths,
+            camera_depths=camera_depths,
+            camera_segmentations=camera_segmentations,
+            renderer=renderer,
+            renderer_config=renderer_config,
+        )
     """
     Custom version of base class for single arm robosuite tasks for mimicgen.
     """
@@ -106,3 +173,109 @@ class SingleArmEnv_MG(SingleArmEnv):
             pos=string_to_array("0.753078462147161 2.062036796036723e-08 1.5194726087166726"),
             quat=string_to_array("0.6432409286499023 0.293668270111084 0.2936684489250183 0.6432408690452576"),
         )
+    
+    def _setup_observables(self):
+        """
+        Sets up observables to be used for this environment. Creates object-based observables if enabled
+
+        Returns:
+            OrderedDict: Dictionary mapping observable names to its corresponding Observable object
+        """
+        observables = super()._setup_observables()
+
+        pf = self.robots[0].robot_model.naming_prefix
+
+        ft_all_denoised_modality = pf + "ft_denoised"
+        ft_all_modality = pf + "forcetorque"
+        prop_all_modality = pf + "proprioception"
+
+        # print("HEREEEEEE", ft_all_denoised_modality)
+
+        @sensor(modality=ft_all_denoised_modality)
+        def ft_all_denoised(obs_cache):
+            ft_curr = np.hstack([self.robots[0].ee_force, self.robots[0].ee_torque])
+            if "ft_all_denoised" in obs_cache.keys():
+                ft_hist = obs_cache['ft_all_denoised']
+                
+                # Add current ft obs to history
+                ft_hist = np.vstack((ft_hist, ft_curr))
+                ft_hist = ft_hist[1:]
+            else:
+                # Pad history to match desired history length
+                ft_hist = np.vstack((ft_curr, np.zeros(ft_curr.shape)))
+                ft_hist = np.pad(ft_hist, pad_width=((self.ft_hist_len-ft_hist.shape[0]+1,0),), mode='edge')
+                ft_hist = ft_hist[:-1, :6]
+            # print("WHATTT", ft_hist)
+            return ft_hist
+        
+        # Force-torque data from both arms
+        @sensor(modality=ft_all_modality)
+        def ft_all(obs_cache):
+            ft_curr = np.hstack([self.robots[0].ee_force, self.robots[0].ee_torque])
+            if "ft_all" in obs_cache.keys():
+                ft_hist = obs_cache['ft_all']
+                
+                # Add current ft obs to history
+                ft_hist = np.vstack((ft_hist, ft_curr))
+                ft_hist = ft_hist[1:]
+            else:
+                # Pad history to match desired history length
+                ft_hist = np.vstack((ft_curr, np.zeros(ft_curr.shape)))
+                ft_hist = np.pad(ft_hist, pad_width=((self.ft_hist_len-ft_hist.shape[0]+1,0),), mode='edge')
+                ft_hist = ft_hist[:-1, :6]
+            return ft_hist
+
+        # End-effector site position and rotation from both arms
+        @sensor(modality=prop_all_modality)
+        def prop_all(obs_cache):
+            eef_pos = np.array(self.robots[0].sim.data.site_xpos[self.robots[0].eef_site_id])
+            eef_quat = T.convert_quat(self.robots[0].sim.data.get_body_xquat(self.robots[0].robot_model.eef_name), to="xyzw")
+            prop_curr = np.hstack([eef_pos, eef_quat])
+            return prop_curr
+
+        # Add in gaussian force-torque corrupter
+        def ft_corrupter(inp):
+            inp_c = np.array(inp)
+
+            # Generate noise 
+            force_noise = self.ft_noise_std[0] * np.random.randn(3)
+            torque_noise = self.ft_noise_std[1] * np.random.randn(3)
+
+            # Apply noise to measurements
+            inp_c[-1,:3] += force_noise[:3]
+            inp_c[-1,3:6] += torque_noise[:3]
+
+            return inp_c
+        
+        # Add in gaussian proprioception corrupter
+        def prop_corrupter(inp):
+            inp_c = np.array(inp)
+
+            # Generate noise
+            pos_noise = self.prop_noise_std[0] * np.random.randn(3)
+            rot_noise = self.prop_noise_std[1] * np.random.randn(3)
+
+            # Apply noise to position measurement
+            inp_c[:3] += pos_noise[:3]
+
+            # Apply noise to rotation measurement
+            quat = inp_c[3:7]
+            inp_c[3:7] = T.quat_multiply(quat, T.mat2quat(T.euler2mat(rot_noise[:3])))
+
+            return inp_c
+
+        sensors = [ft_all_denoised, ft_all, prop_all]
+        corrupters = [None, ft_corrupter, prop_corrupter]
+        names = [s.__name__ for s in sensors]
+
+        for name, s, c in zip(names, sensors, corrupters):
+            observables[name] = Observable(
+                name=name,
+                sensor=s,
+                corrupter=c,
+                sampling_rate=self.control_freq,
+            )
+
+        return observables
+
+
