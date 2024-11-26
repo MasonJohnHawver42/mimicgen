@@ -49,7 +49,7 @@ class SingleArmEnv_MG(SingleArmEnv):
         camera_widths=256,
         camera_depths=False,
         camera_segmentations=None,  # {None, instance, class, element}
-        force_torque_hist_len=100,
+        force_torque_hist_len=32,
         renderer="mujoco",
         renderer_config=None    
     ):
